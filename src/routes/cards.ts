@@ -3,12 +3,12 @@
  * store, return the result. Every permission rule lives in the domain core /
  * store, which throws typed errors the app-level handler maps to responses
  * (PermissionError → 403, NotFoundError → 404, ValidationError → 400,
- * UnauthorizedError → 401) — a disallowed request fails closed, never gets
- * coerced.
+ * ConflictError → 409, UnauthorizedError → 401) — a disallowed request
+ * fails closed, never gets coerced.
  *
  * Shape: resource routes for the card itself, action sub-routes for the
- * audited acts (transition, executor, review-policy, annotations). The
- * OpenAPI spec is generated from these route schemas (served at
+ * audited acts (transition, executor, review-policy, annotations, schedule).
+ * The OpenAPI spec is generated from these route schemas (served at
  * /openapi.json), so the schemas are the API contract — keep them honest.
  */
 
@@ -40,7 +40,6 @@ declare module "fastify" {
   }
 }
 
-
 const cardSchema = {
   $id: "Card",
   type: "object",
@@ -52,6 +51,7 @@ const cardSchema = {
     executor: { type: "string", enum: [...EXECUTORS] },
     reviewPolicy: { type: "string", enum: [...REVIEW_POLICIES] },
     pausedFrom: { type: ["string", "null"], enum: [...CARD_STATES, null] },
+    scheduledFor: { type: ["string", "null"] },
     labels: {
       type: "object",
       properties: {
@@ -72,6 +72,7 @@ const cardSchema = {
     "executor",
     "reviewPolicy",
     "pausedFrom",
+    "scheduledFor",
     "labels",
     "createdAt",
     "updatedAt",
@@ -127,12 +128,16 @@ const idParams = {
   required: ["id"],
 } as const;
 
-/** Standard error responses for a mutating route on an existing card. */
 const mutationErrors = {
   400: { $ref: "Error#" },
   401: { $ref: "Error#" },
   403: { $ref: "Error#" },
   404: { $ref: "Error#" },
+} as const;
+
+const mutationErrorsWithConflict = {
+  ...mutationErrors,
+  409: { $ref: "Error#" },
 } as const;
 
 export interface CardRoutesOptions {
@@ -143,9 +148,6 @@ export interface CardRoutesOptions {
 export async function cardRoutes(app: FastifyInstance, opts: CardRoutesOptions): Promise<void> {
   const { store, resolveActor } = opts;
 
-  // Every board route — reads included; the board is personal data —
-  // requires a credential. onRequest so an unauthenticated request is
-  // refused before its body is even parsed.
   app.decorateRequest("actor", null as unknown as StoreActor);
   app.addHook("onRequest", async (request) => {
     request.actor = resolveActor(request);
@@ -155,6 +157,7 @@ export async function cardRoutes(app: FastifyInstance, opts: CardRoutesOptions):
     Body: {
       title: string;
       description?: string;
+      scheduledFor?: string;
       category?: Category;
       focus?: boolean;
       pendingTier?: PendingTier;
@@ -164,12 +167,14 @@ export async function cardRoutes(app: FastifyInstance, opts: CardRoutesOptions):
     {
       schema: {
         summary: "Create a card (into inbox)",
-        description: "Human capture or agent-proposed work. The card starts untriaged in inbox.",
+        description:
+          "Human capture or agent-proposed work. The card starts untriaged in inbox. Optionally set scheduledFor (ISO date) for auto-promotion to staging.",
         body: {
           type: "object",
           properties: {
             title: { type: "string", minLength: 1 },
             description: { type: "string" },
+            scheduledFor: { type: "string", format: "date" },
             category: { type: "string", enum: [...CATEGORIES] },
             focus: { type: "boolean" },
             pendingTier: { type: "string", enum: [...PENDING_TIERS] },
@@ -177,7 +182,12 @@ export async function cardRoutes(app: FastifyInstance, opts: CardRoutesOptions):
           required: ["title"],
           additionalProperties: false,
         },
-        response: { 201: { $ref: "Card#" }, 400: { $ref: "Error#" }, 401: { $ref: "Error#" }, 403: { $ref: "Error#" } },
+        response: {
+          201: { $ref: "Card#" },
+          400: { $ref: "Error#" },
+          401: { $ref: "Error#" },
+          403: { $ref: "Error#" },
+        },
       },
     },
     async (request, reply) => {
@@ -254,7 +264,7 @@ export async function cardRoutes(app: FastifyInstance, opts: CardRoutesOptions):
       schema: {
         summary: "Move a card to a new state",
         description:
-          "Consults the domain state machine and fails closed (403) on anything it disallows. Some transitions require a note (400 without one): an agent entering manual_review or blocked, an agent auto-closing, and every review outcome.",
+          "Consults the domain state machine and fails closed (403) on anything it disallows. Some transitions require a note (400 without one). Moving to active returns 409 if the executor already has an active card.",
         params: idParams,
         body: {
           type: "object",
@@ -265,11 +275,34 @@ export async function cardRoutes(app: FastifyInstance, opts: CardRoutesOptions):
           required: ["to"],
           additionalProperties: false,
         },
-        response: { 200: { $ref: "Card#" }, ...mutationErrors },
+        response: { 200: { $ref: "Card#" }, ...mutationErrorsWithConflict },
       },
     },
     async (request) =>
       store.transitionCard(request.params.id, request.body.to, request.actor, request.body.note),
+  );
+
+  app.post<{ Params: { id: string }; Body: { scheduledFor: string | null } }>(
+    "/cards/:id/schedule",
+    {
+      schema: {
+        summary: "Set or clear the scheduled date on a card (human-only)",
+        description:
+          "Cards with a scheduledFor date in the past or present are auto-promoted from inbox to staging. Send null to clear the date.",
+        params: idParams,
+        body: {
+          type: "object",
+          properties: {
+            scheduledFor: { type: ["string", "null"], format: "date" },
+          },
+          required: ["scheduledFor"],
+          additionalProperties: false,
+        },
+        response: { 200: { $ref: "Card#" }, ...mutationErrors },
+      },
+    },
+    async (request) =>
+      store.setScheduledFor(request.params.id, request.body.scheduledFor, request.actor),
   );
 
   app.post<{ Params: { id: string }; Body: { executor: ExecutorType; note?: string } }>(
@@ -392,5 +425,22 @@ export async function cardRoutes(app: FastifyInstance, opts: CardRoutesOptions):
       }
       return store.listEvents(request.params.id);
     },
+  );
+
+  app.post(
+    "/system/promote-scheduled",
+    {
+      schema: {
+        summary: "Promote inbox cards whose scheduledFor date has arrived into staging",
+        description:
+          "Intended to be called on a daily schedule (cron) or at board load. Returns the list of promoted cards.",
+        response: {
+          200: { type: "array", items: { $ref: "Card#" } },
+          401: { $ref: "Error#" },
+          403: { $ref: "Error#" },
+        },
+      },
+    },
+    async () => store.promoteScheduled(),
   );
 }

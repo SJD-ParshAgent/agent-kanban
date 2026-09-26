@@ -8,7 +8,7 @@
  * an illegal transition, executor change, or review-policy change is refused
  * with a typed error before anything is written. The API layer maps these to
  * responses (PermissionError → 403, NotFoundError → 404, ValidationError →
- * 400) — it never needs to duplicate the rules to stay safe.
+ * 400, ConflictError → 409) — it never needs to duplicate the rules.
  */
 
 import { randomUUID } from "node:crypto";
@@ -19,6 +19,7 @@ import {
   canChangeReviewPolicy,
   canCreateCard,
   canEditCard,
+  canScheduleCard,
   canTransition,
   isTerminal,
   type ActorType,
@@ -36,6 +37,8 @@ export class PermissionError extends Error {}
 export class NotFoundError extends Error {}
 /** The request itself is malformed (e.g. a missing required note). Maps to 400. */
 export class ValidationError extends Error {}
+/** A constraint conflict (e.g. executor already has an active card). Maps to 409. */
+export class ConflictError extends Error {}
 
 /** An authenticated caller: type drives permissions, id goes in the audit trail. */
 export interface StoreActor {
@@ -52,6 +55,8 @@ export interface Card {
   reviewPolicy: ReviewPolicy;
   /** For blocked/waiting cards: the state to resume to. */
   pausedFrom: CardState | null;
+  /** ISO date; system auto-promotes inbox cards to staging when this date arrives. */
+  scheduledFor: string | null;
   labels: Labels;
   createdAt: string;
   updatedAt: string;
@@ -64,6 +69,7 @@ export const EVENT_TYPES = [
   "executor_changed",
   "review_policy_changed",
   "labels_changed",
+  "scheduled_for_changed",
   "annotation_added",
 ] as const;
 
@@ -93,6 +99,7 @@ interface CardRow {
   executor: string;
   review_policy: string;
   paused_from: string | null;
+  scheduled_for: string | null;
   category: string | null;
   focus: number;
   pending_tier: string | null;
@@ -124,6 +131,7 @@ function toCard(row: CardRow): Card {
     executor: row.executor as ExecutorType,
     reviewPolicy: row.review_policy as ReviewPolicy,
     pausedFrom: row.paused_from as CardState | null,
+    scheduledFor: row.scheduled_for,
     labels: {
       category: row.category as Category | null,
       focus: row.focus === 1,
@@ -154,6 +162,7 @@ function toEvent(row: EventRow): CardEvent {
 export interface CreateCardInput {
   title: string;
   description?: string;
+  scheduledFor?: string | null;
   category?: Category | null;
   focus?: boolean;
   pendingTier?: PendingTier | null;
@@ -190,6 +199,7 @@ export class CardStore {
     const id = randomUUID();
     const now = new Date().toISOString();
     const description = input.description ?? "";
+    const scheduledFor = input.scheduledFor ?? null;
     const category = input.category ?? null;
     const focus = input.focus ?? false;
     const pendingTier = input.pendingTier ?? null;
@@ -197,10 +207,10 @@ export class CardStore {
     this.db.transaction(() => {
       this.db
         .prepare(
-          `INSERT INTO cards (id, title, description, state, executor, review_policy, paused_from, category, focus, pending_tier, created_at, updated_at)
-           VALUES (@id, @title, @description, 'inbox', 'unassigned', 'reviewed', NULL, @category, @focus, @pendingTier, @now, @now)`,
+          `INSERT INTO cards (id, title, description, state, executor, review_policy, paused_from, scheduled_for, category, focus, pending_tier, created_at, updated_at)
+           VALUES (@id, @title, @description, 'inbox', 'unassigned', 'reviewed', NULL, @scheduledFor, @category, @focus, @pendingTier, @now, @now)`,
         )
-        .run({ id, title, description, category, focus: focus ? 1 : 0, pendingTier, now });
+        .run({ id, title, description, scheduledFor, category, focus: focus ? 1 : 0, pendingTier, now });
       this.appendEvent({
         cardId: id,
         type: "card_created",
@@ -208,7 +218,7 @@ export class CardStore {
         toState: "inbox",
         executor: "unassigned",
         reviewPolicy: "reviewed",
-        payload: { title, description, category, focus, pendingTier },
+        payload: { title, description, scheduledFor, category, focus, pendingTier },
         createdAt: now,
       });
     })();
@@ -293,8 +303,8 @@ export class CardStore {
   }
 
   /**
-   * Move a card to a new state. Consults the domain core; refuses (without
-   * writing) anything it disallows, including a missing required note.
+   * Move a card to a new state. Enforces domain rules and single-occupancy
+   * on `active` (one card per executor at a time — 409 if already occupied).
    */
   transitionCard(id: string, to: CardState, actor: StoreActor, note?: string): Card {
     const card = this.mustGet(id);
@@ -311,6 +321,18 @@ export class CardStore {
     if (!decision.allowed) throw new PermissionError(decision.reason);
     if (decision.noteRequired && !note?.trim()) {
       throw new ValidationError(`a note is required to move this card to ${to}`);
+    }
+
+    // Single-occupancy: the executor may only have one card in `active`.
+    if (to === "active" && card.executor !== "unassigned") {
+      const conflict = this.db
+        .prepare("SELECT id FROM cards WHERE state = 'active' AND executor = ? AND id != ?")
+        .get(card.executor, id);
+      if (conflict) {
+        throw new ConflictError(
+          `${card.executor} executor already has an active card; finish or pause it first`,
+        );
+      }
     }
 
     const now = new Date().toISOString();
@@ -334,6 +356,72 @@ export class CardStore {
     })();
 
     return this.mustGet(id);
+  }
+
+  /** Set or clear the scheduled date on an inbox card — human-only. */
+  setScheduledFor(id: string, scheduledFor: string | null, actor: StoreActor): Card {
+    if (!canScheduleCard({ type: actor.type })) {
+      throw new PermissionError("only a human may set a card's scheduled date");
+    }
+    const card = this.mustGet(id);
+    if (isTerminal(card.state)) {
+      throw new ValidationError(`cannot schedule a ${card.state} card`);
+    }
+
+    const now = new Date().toISOString();
+    this.db.transaction(() => {
+      this.db
+        .prepare("UPDATE cards SET scheduled_for = ?, updated_at = ? WHERE id = ?")
+        .run(scheduledFor, now, id);
+      this.appendEvent({
+        cardId: id,
+        type: "scheduled_for_changed",
+        actor,
+        executor: card.executor,
+        reviewPolicy: card.reviewPolicy,
+        payload: { from: card.scheduledFor, to: scheduledFor },
+        createdAt: now,
+      });
+    })();
+
+    return this.mustGet(id);
+  }
+
+  /**
+   * Auto-promote inbox cards whose scheduledFor date has arrived into staging.
+   * Called by the system on a schedule (e.g. daily cron or on board load).
+   * Returns the promoted cards.
+   */
+  promoteScheduled(today: string = new Date().toISOString().slice(0, 10)): Card[] {
+    const systemActor: StoreActor = { id: "system", type: "system" };
+    const due = this.db
+      .prepare(
+        "SELECT * FROM cards WHERE state = 'inbox' AND scheduled_for IS NOT NULL AND scheduled_for <= ?",
+      )
+      .all(today) as CardRow[];
+
+    const promoted: Card[] = [];
+    for (const row of due) {
+      const card = toCard(row);
+      const now = new Date().toISOString();
+      this.db.transaction(() => {
+        this.db
+          .prepare("UPDATE cards SET state = 'staging', paused_from = NULL, updated_at = ? WHERE id = ?")
+          .run(now, card.id);
+        this.appendEvent({
+          cardId: card.id,
+          type: "state_transitioned",
+          actor: systemActor,
+          fromState: "inbox",
+          toState: "staging",
+          executor: card.executor,
+          reviewPolicy: card.reviewPolicy,
+          createdAt: now,
+        });
+      })();
+      promoted.push(this.mustGet(card.id));
+    }
+    return promoted;
   }
 
   /** Offload a card or take it back — the human's act, always. */
@@ -521,8 +609,8 @@ export function rebuildProjection(db: Db): void {
     db.prepare("DELETE FROM cards").run();
 
     const insertCard = db.prepare(
-      `INSERT INTO cards (id, title, description, state, executor, review_policy, paused_from, category, focus, pending_tier, created_at, updated_at)
-       VALUES (@id, @title, @description, @state, @executor, @reviewPolicy, @pausedFrom, @category, @focus, @pendingTier, @createdAt, @updatedAt)`,
+      `INSERT INTO cards (id, title, description, state, executor, review_policy, paused_from, scheduled_for, category, focus, pending_tier, created_at, updated_at)
+       VALUES (@id, @title, @description, @state, @executor, @reviewPolicy, @pausedFrom, @scheduledFor, @category, @focus, @pendingTier, @createdAt, @updatedAt)`,
     );
     const updateContent = db.prepare(
       "UPDATE cards SET title = ?, description = ?, updated_at = ? WHERE id = ?",
@@ -539,6 +627,9 @@ export function rebuildProjection(db: Db): void {
     const updateLabels = db.prepare(
       "UPDATE cards SET category = ?, focus = ?, pending_tier = ?, updated_at = ? WHERE id = ?",
     );
+    const updateScheduledFor = db.prepare(
+      "UPDATE cards SET scheduled_for = ?, updated_at = ? WHERE id = ?",
+    );
 
     const rows = db.prepare("SELECT * FROM events ORDER BY id").all() as EventRow[];
     for (const row of rows) {
@@ -554,6 +645,7 @@ export function rebuildProjection(db: Db): void {
             executor: event.executor,
             reviewPolicy: event.reviewPolicy,
             pausedFrom: null,
+            scheduledFor: p.scheduledFor ?? null,
             category: p.category ?? null,
             focus: p.focus ? 1 : 0,
             pendingTier: p.pendingTier ?? null,
@@ -582,6 +674,11 @@ export function rebuildProjection(db: Db): void {
         case "labels_changed": {
           const p = event.payload ?? {};
           updateLabels.run(p.category ?? null, p.focus ? 1 : 0, p.pendingTier ?? null, event.createdAt, event.cardId);
+          break;
+        }
+        case "scheduled_for_changed": {
+          const p = event.payload ?? {};
+          updateScheduledFor.run(p.to ?? null, event.createdAt, event.cardId);
           break;
         }
         case "annotation_added":

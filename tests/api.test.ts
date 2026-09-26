@@ -33,14 +33,13 @@ async function createCard(title = "a task"): Promise<string> {
   return res.json().id as string;
 }
 
-/** Create a card, hand it to the agent, and walk it to in_progress. */
+/** Create a card, hand it to the agent, and walk it to active. */
 async function delegatedCard(): Promise<string> {
   const id = await createCard("delegated task");
   const steps = [
     { url: `/cards/${id}/executor`, payload: { executor: "agent" }, headers: asHuman },
-    { url: `/cards/${id}/transition`, payload: { to: "backlog" }, headers: asHuman },
-    { url: `/cards/${id}/transition`, payload: { to: "ready" }, headers: asHuman },
-    { url: `/cards/${id}/transition`, payload: { to: "in_progress" }, headers: asAgent },
+    { url: `/cards/${id}/transition`, payload: { to: "staging" }, headers: asHuman },
+    { url: `/cards/${id}/transition`, payload: { to: "active" }, headers: asAgent },
   ];
   for (const step of steps) {
     const res = await app.inject({ method: "POST", ...step });
@@ -65,7 +64,19 @@ describe("POST /cards", () => {
       executor: "unassigned",
       reviewPolicy: "reviewed",
       pausedFrom: null,
+      scheduledFor: null,
     });
+  });
+
+  it("accepts scheduledFor at creation time", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/cards",
+      headers: asHuman,
+      payload: { title: "future task", scheduledFor: "2030-01-01" },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().scheduledFor).toBe("2030-01-01");
   });
 
   it("rejects a request without a token with 401", async () => {
@@ -117,7 +128,7 @@ describe("GET /cards and GET /cards/:id", () => {
     expect(agents.json()).toHaveLength(1);
     expect(agents.json()[0].id).toBe(first);
 
-    const none = await app.inject({ method: "GET", url: "/cards?state=done", headers: asHuman });
+    const none = await app.inject({ method: "GET", url: "/cards?state=log", headers: asHuman });
     expect(none.json()).toEqual([]);
   });
 
@@ -163,26 +174,26 @@ describe("PATCH /cards/:id", () => {
 });
 
 describe("POST /cards/:id/transition", () => {
-  it("walks the delegated lifecycle to done", async () => {
+  it("walks the delegated lifecycle to log", async () => {
     const id = await delegatedCard();
 
     const review = await app.inject({
       method: "POST",
       url: `/cards/${id}/transition`,
       headers: asAgent,
-      payload: { to: "manual_review", note: "done; next: ship it" },
+      payload: { to: "staging", note: "done; next: ship it" },
     });
     expect(review.statusCode).toBe(200);
-    expect(review.json().state).toBe("manual_review");
+    expect(review.json().state).toBe("staging");
 
-    const done = await app.inject({
+    const logged = await app.inject({
       method: "POST",
       url: `/cards/${id}/transition`,
       headers: asHuman,
-      payload: { to: "done", note: "looks good" },
+      payload: { to: "log", note: "looks good" },
     });
-    expect(done.statusCode).toBe(200);
-    expect(done.json().state).toBe("done");
+    expect(logged.statusCode).toBe(200);
+    expect(logged.json().state).toBe("log");
   });
 
   it("fails closed with 403 when an agent tries a human-only transition", async () => {
@@ -191,7 +202,7 @@ describe("POST /cards/:id/transition", () => {
       method: "POST",
       url: `/cards/${id}/transition`,
       headers: asAgent,
-      payload: { to: "backlog" },
+      payload: { to: "staging" },
     });
     expect(res.statusCode).toBe(403);
 
@@ -205,9 +216,36 @@ describe("POST /cards/:id/transition", () => {
       method: "POST",
       url: `/cards/${id}/transition`,
       headers: asAgent,
-      payload: { to: "manual_review" },
+      payload: { to: "staging" },
     });
     expect(res.statusCode).toBe(400);
+  });
+
+  it("returns 409 when the executor already has an active card", async () => {
+    await delegatedCard(); // agent now has an active card
+
+    const id2 = await createCard("second task");
+    await app.inject({
+      method: "POST",
+      url: `/cards/${id2}/executor`,
+      headers: asHuman,
+      payload: { executor: "agent" },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/cards/${id2}/transition`,
+      headers: asHuman,
+      payload: { to: "staging" },
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/cards/${id2}/transition`,
+      headers: asAgent,
+      payload: { to: "active" },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toHaveProperty("error");
   });
 
   it("returns 404 for a missing card", async () => {
@@ -215,7 +253,7 @@ describe("POST /cards/:id/transition", () => {
       method: "POST",
       url: "/cards/nope/transition",
       headers: asHuman,
-      payload: { to: "backlog" },
+      payload: { to: "staging" },
     });
     expect(res.statusCode).toBe(404);
   });
@@ -251,14 +289,92 @@ describe("POST /cards/:id/executor and /review-policy", () => {
     });
     expect(grant.statusCode).toBe(200);
 
-    const done = await app.inject({
+    const logged = await app.inject({
       method: "POST",
       url: `/cards/${id}/transition`,
       headers: asAgent,
-      payload: { to: "done", note: "ran clean" },
+      payload: { to: "log", note: "ran clean" },
     });
-    expect(done.statusCode).toBe(200);
-    expect(done.json().state).toBe("done");
+    expect(logged.statusCode).toBe(200);
+    expect(logged.json().state).toBe("log");
+  });
+});
+
+describe("POST /cards/:id/schedule", () => {
+  it("sets a scheduled date (human-only) and returns the updated card", async () => {
+    const id = await createCard();
+    const res = await app.inject({
+      method: "POST",
+      url: `/cards/${id}/schedule`,
+      headers: asHuman,
+      payload: { scheduledFor: "2030-06-01" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().scheduledFor).toBe("2030-06-01");
+  });
+
+  it("clears the scheduled date when null is sent", async () => {
+    const id = await createCard();
+    await app.inject({
+      method: "POST",
+      url: `/cards/${id}/schedule`,
+      headers: asHuman,
+      payload: { scheduledFor: "2030-06-01" },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: `/cards/${id}/schedule`,
+      headers: asHuman,
+      payload: { scheduledFor: null },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().scheduledFor).toBeNull();
+  });
+
+  it("refuses an agent with 403", async () => {
+    const id = await createCard();
+    const res = await app.inject({
+      method: "POST",
+      url: `/cards/${id}/schedule`,
+      headers: asAgent,
+      payload: { scheduledFor: "2030-06-01" },
+    });
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+describe("POST /system/promote-scheduled", () => {
+  it("promotes inbox cards whose scheduledFor date has arrived", async () => {
+    // Create a past-due card
+    await app.inject({
+      method: "POST",
+      url: "/cards",
+      headers: asHuman,
+      payload: { title: "past due", scheduledFor: "2020-01-01" },
+    });
+    // Create a future card — should NOT be promoted
+    await app.inject({
+      method: "POST",
+      url: "/cards",
+      headers: asHuman,
+      payload: { title: "future", scheduledFor: "2099-01-01" },
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/system/promote-scheduled",
+      headers: asHuman,
+    });
+    expect(res.statusCode).toBe(200);
+    const promoted = res.json() as { title: string; state: string }[];
+    expect(promoted).toHaveLength(1);
+    expect(promoted[0]!.title).toBe("past due");
+    expect(promoted[0]!.state).toBe("staging");
+  });
+
+  it("requires a token", async () => {
+    const res = await app.inject({ method: "POST", url: "/system/promote-scheduled" });
+    expect(res.statusCode).toBe(401);
   });
 });
 
@@ -404,7 +520,7 @@ describe("POST /cards/:id/labels", () => {
 });
 
 describe("GET /openapi.json", () => {
-  it("serves an OpenAPI spec (no token needed) covering the card routes", async () => {
+  it("serves an OpenAPI spec covering the card routes", async () => {
     const res = await app.inject({ method: "GET", url: "/openapi.json" });
     expect(res.statusCode).toBe(200);
     const spec = res.json();
@@ -414,11 +530,13 @@ describe("GET /openapi.json", () => {
       "/cards",
       "/cards/{id}",
       "/cards/{id}/transition",
+      "/cards/{id}/schedule",
       "/cards/{id}/executor",
       "/cards/{id}/review-policy",
       "/cards/{id}/labels",
       "/cards/{id}/annotations",
       "/cards/{id}/events",
+      "/system/promote-scheduled",
     ]) {
       expect(spec.paths).toHaveProperty(path);
     }

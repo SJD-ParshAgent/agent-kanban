@@ -9,7 +9,7 @@ Working queue and build order. Keep one item **In progress** at a time; move fin
 *(nothing)*
 
 ## Next
-2. **Recurrence / template cards** — promoted up from Later: a scheduled clone of a template card into `Inbox`/`Ready` (open question in `docs/state-machine.md`). Needed for both autopilot scheduling and the ritual cards below.
+2. **Recurrence / template cards** — a scheduled clone of a template card into `inbox`/`staging` (open question in `docs/state-machine.md`). Needed for both autopilot scheduling and the ritual cards below.
 3. **Ritual cards** — weekly accountability + quarterly planning/purge as recurring, agent-executed cards per `docs/productivity-purge.md`.
 4. **Reassess** — with the above in place, drive the board via `curl` with an agent token for the first real end-to-end validation: dogfood the roadmap *and* the purge rituals onto it.
 
@@ -21,6 +21,8 @@ Working queue and build order. Keep one item **In progress** at a time; move fin
 - Web UI
 
 ## Done
+
+- Board state machine redesign + UI — replaced `inbox/backlog/ready/in_progress/manual_review/done` with the working-memory model (`inbox/staging/active/log`). Added `scheduledFor` field for date-based auto-promotion. Single-occupancy enforcement on `active` (409). Agent-completed work routes to `staging` for human review. Board UI at `GET /board?t=TOKEN` (server-rendered HTML, plain forms, dark theme). `POST /system/promote-scheduled` auto-promotes due inbox cards. 120 tests. *(2026-09-12)*
 
 - Label schema — `category` (`professional`/`community`/`personal`), `focus` (boolean starred flag), `pending-tier` (`daydream`/`white-whale`) as first-class card fields. DB migration (v2) adds three columns; `setLabels()` is human-only with partial-update semantics; optional on create; `GET /cards` accepts `category` and `focus` filters; `POST /cards/:id/labels` endpoint; `labels_changed` event in the audit trail; `rebuildProjection` replays label events. 17 new tests. *(2026-08-13)*
 

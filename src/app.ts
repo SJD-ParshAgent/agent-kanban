@@ -1,8 +1,12 @@
 import Fastify, { type FastifyError, type FastifyInstance } from "fastify";
 import swagger from "@fastify/swagger";
+import staticFiles from "@fastify/static";
+import { fileURLToPath } from "node:url";
+import { join, dirname } from "node:path";
 import { openDb } from "./persistence/db.js";
 import {
   CardStore,
+  ConflictError,
   NotFoundError,
   PermissionError,
   ValidationError,
@@ -14,6 +18,9 @@ import {
   type Credential,
 } from "./routes/actor.js";
 import { apiSchemas, cardRoutes } from "./routes/cards.js";
+import { boardRoutes } from "./routes/board.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export interface BuildAppOptions {
   /** SQLite path. Defaults to DATABASE_PATH / data/agent-kanban.db; tests pass ":memory:". */
@@ -29,7 +36,8 @@ export interface BuildAppOptions {
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const app = Fastify({ logger: false });
 
-  const resolveActor = createActorResolver(options.credentials ?? credentialsFromEnv());
+  const creds = options.credentials ?? credentialsFromEnv();
+  const resolveActor = createActorResolver(creds);
 
   const db = openDb(options.dbPath);
   const store = new CardStore(db);
@@ -45,6 +53,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     if (error instanceof PermissionError) return reply.code(403).send({ error: error.message });
     if (error instanceof NotFoundError) return reply.code(404).send({ error: error.message });
     if (error instanceof ValidationError) return reply.code(400).send({ error: error.message });
+    if (error instanceof ConflictError) return reply.code(409).send({ error: error.message });
     if (error.validation) return reply.code(400).send({ error: error.message });
     request.log.error(error);
     return reply.code(500).send({ error: "internal error" });
@@ -75,6 +84,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     },
   });
 
+  // Serve CSS and other static assets from the public/ directory.
+  app.register(staticFiles, {
+    root: join(__dirname, "..", "public"),
+    prefix: "/",
+    decorateReply: false,
+  });
+
   app.get("/health", { schema: { security: [] } }, async () => {
     return { status: "ok" };
   });
@@ -82,6 +98,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.get("/openapi.json", { schema: { hide: true } }, async () => app.swagger());
 
   app.register(cardRoutes, { store, resolveActor });
+  app.register(boardRoutes, { store, credentials: creds });
 
   return app;
 }

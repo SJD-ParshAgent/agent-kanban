@@ -53,103 +53,129 @@ describe("creation and governance", () => {
   });
 });
 
-describe("triage and scheduling (human-only planning space)", () => {
-  it.each([
-    ["inbox", "backlog"],
-    ["backlog", "ready"],
-  ] as const)("%s → %s: human yes, agent and system no", (from, to) => {
-    expectAllowed(card(from, { executor: "agent" }), to, human);
-    expectDenied(card(from, { executor: "agent" }), to, agent);
-    expectDenied(card(from, { executor: "agent" }), to, system);
+describe("inbox → staging (human schedules work for today)", () => {
+  it("human may schedule any inbox card", () => {
+    expectAllowed(card("inbox", { executor: "human" }), "staging", human);
+    expectAllowed(card("inbox", { executor: "agent" }), "staging", human);
+    expectAllowed(card("inbox", { executor: "unassigned" }), "staging", human);
+  });
+
+  it("agent and system may not schedule", () => {
+    expectDenied(card("inbox", { executor: "agent" }), "staging", agent);
+    expectDenied(card("inbox", { executor: "agent" }), "staging", system);
   });
 });
 
-describe("ready → in_progress (executor picks up)", () => {
-  it("the executor may pick the card up", () => {
-    expectAllowed(card("ready", { executor: "human" }), "in_progress", human);
-    expectAllowed(card("ready", { executor: "agent" }), "in_progress", agent);
+describe("staging → active (executor picks up)", () => {
+  it("the executor picks up their own staged work", () => {
+    expectAllowed(card("staging", { executor: "human" }), "active", human);
+    expectAllowed(card("staging", { executor: "agent" }), "active", agent);
   });
 
-  it("non-executors may not — not even the human on an agent card", () => {
-    expectDenied(card("ready", { executor: "agent" }), "in_progress", human);
-    expectDenied(card("ready", { executor: "human" }), "in_progress", agent);
-    expectDenied(card("ready", { executor: "unassigned" }), "in_progress", human);
-    expectDenied(card("ready", { executor: "unassigned" }), "in_progress", agent);
-    expectDenied(card("ready", { executor: "agent" }), "in_progress", system);
+  it("human may send agent-completed staging work back for rework (note required)", () => {
+    expectAllowed(card("staging", { executor: "agent" }), "active", human, true);
+  });
+
+  it("agent may not pick up a human card", () => {
+    expectDenied(card("staging", { executor: "human" }), "active", agent);
+  });
+
+  it("system may not pick up cards", () => {
+    expectDenied(card("staging", { executor: "human" }), "active", system);
+    expectDenied(card("staging", { executor: "agent" }), "active", system);
+  });
+
+  it("unassigned cards cannot be picked up", () => {
+    expectDenied(card("staging", { executor: "unassigned" }), "active", human);
+    expectDenied(card("staging", { executor: "unassigned" }), "active", agent);
   });
 });
 
-describe("completing work", () => {
-  it("the human closes their own work directly, no review gate", () => {
-    expectAllowed(card("in_progress", { executor: "human" }), "done", human);
+describe("staging → log (human closes or approves)", () => {
+  it("human may close their own staged work directly", () => {
+    expectAllowed(card("staging", { executor: "human" }), "log", human);
+  });
+
+  it("human may approve agent-completed work from staging", () => {
+    expectAllowed(card("staging", { executor: "agent" }), "log", human);
+  });
+
+  it("agent may not close work from staging", () => {
+    expectDenied(card("staging", { executor: "agent" }), "log", agent);
+    expectDenied(card("staging", { executor: "human" }), "log", agent);
+  });
+});
+
+describe("staging → inbox (human re-scopes, note required)", () => {
+  it("human may re-scope any staged card back to inbox", () => {
+    expectAllowed(card("staging", { executor: "human" }), "inbox", human, true);
+    expectAllowed(card("staging", { executor: "agent" }), "inbox", human, true);
+  });
+
+  it("agent and system may not re-scope", () => {
+    expectDenied(card("staging", { executor: "agent" }), "inbox", agent);
+    expectDenied(card("staging", { executor: "agent" }), "inbox", system);
+  });
+});
+
+describe("completing active work", () => {
+  it("the human closes their own active work directly, no review gate", () => {
+    expectAllowed(card("active", { executor: "human" }), "log", human);
   });
 
   it("an agent never closes human-executed work", () => {
-    expectDenied(card("in_progress", { executor: "human" }), "done", agent);
+    expectDenied(card("active", { executor: "human" }), "log", agent);
   });
 
-  it("a reviewed agent card gates through manual review (note required)", () => {
-    const c = card("in_progress", { executor: "agent", reviewPolicy: "reviewed" });
-    expectAllowed(c, "manual_review", agent, true);
-    expectDenied(c, "done", agent); // may not skip the gate
-    expectDenied(c, "done", human); // human closes it via review, not directly
+  it("a reviewed agent card routes to staging for human review (note required)", () => {
+    const c = card("active", { executor: "agent", reviewPolicy: "reviewed" });
+    expectAllowed(c, "staging", agent, true);
+    expectDenied(c, "log", agent); // may not skip the review gate
+    expectDenied(c, "log", human); // human closes via staging approval, not directly
   });
 
   it("an auto agent card closes directly (summary still required)", () => {
-    const c = card("in_progress", { executor: "agent", reviewPolicy: "auto" });
-    expectAllowed(c, "done", agent, true);
+    const c = card("active", { executor: "agent", reviewPolicy: "auto" });
+    expectAllowed(c, "log", agent, true);
   });
 
-  it("an auto card may always escalate into manual review", () => {
-    const c = card("in_progress", { executor: "agent", reviewPolicy: "auto" });
-    expectAllowed(c, "manual_review", agent, true);
+  it("an auto card may always escalate into staging review", () => {
+    const c = card("active", { executor: "agent", reviewPolicy: "auto" });
+    expectAllowed(c, "staging", agent, true);
   });
 
-  it("manual review is for agent-executed cards only", () => {
-    expectDenied(card("in_progress", { executor: "human" }), "manual_review", human);
-    expectDenied(card("in_progress", { executor: "human" }), "manual_review", agent);
+  it("staging review is for agent-executed cards only", () => {
+    expectDenied(card("active", { executor: "human" }), "staging", human);
+    expectDenied(card("active", { executor: "human" }), "staging", agent);
   });
 
-  it("a human may not push an agent's card into review", () => {
-    expectDenied(card("in_progress", { executor: "agent" }), "manual_review", human);
-  });
-});
-
-describe("manual review outcomes (human-only, reason required)", () => {
-  it.each([
-    ["done"], // approve
-    ["in_progress"], // rework
-    ["backlog"], // re-scope
-  ] as const)("manual_review → %s: human yes with note, agent no", (to) => {
-    const c = card("manual_review", { executor: "agent" });
-    expectAllowed(c, to, human, true);
-    expectDenied(c, to, agent);
-    expectDenied(c, to, system);
+  it("a human may not push an agent's active card into staging", () => {
+    expectDenied(card("active", { executor: "agent" }), "staging", human);
   });
 });
 
 describe("pausing (blocked / waiting)", () => {
   it("the executor or the human may block a card", () => {
-    expectAllowed(card("ready", { executor: "human" }), "blocked", human);
-    expectAllowed(card("in_progress", { executor: "agent" }), "blocked", human);
-    expectAllowed(card("in_progress", { executor: "human" }), "blocked", human);
+    expectAllowed(card("staging", { executor: "human" }), "blocked", human);
+    expectAllowed(card("active", { executor: "agent" }), "blocked", human);
+    expectAllowed(card("active", { executor: "human" }), "blocked", human);
   });
 
   it("an agent blocking its own card must note what is needed", () => {
-    expectAllowed(card("in_progress", { executor: "agent" }), "blocked", agent, true);
+    expectAllowed(card("active", { executor: "agent" }), "blocked", agent, true);
   });
 
   it("an agent may not pause someone else's card", () => {
-    expectDenied(card("in_progress", { executor: "human" }), "blocked", agent);
-    expectDenied(card("in_progress", { executor: "human" }), "waiting", agent);
+    expectDenied(card("active", { executor: "human" }), "blocked", agent);
+    expectDenied(card("active", { executor: "human" }), "waiting", agent);
   });
 
   it("the system may park a card in waiting but not blocked", () => {
-    expectAllowed(card("in_progress", { executor: "agent" }), "waiting", system);
-    expectDenied(card("in_progress", { executor: "agent" }), "blocked", system);
+    expectAllowed(card("active", { executor: "agent" }), "waiting", system);
+    expectDenied(card("active", { executor: "agent" }), "blocked", system);
   });
 
-  it.each([["inbox"], ["backlog"], ["manual_review"]] as const)(
+  it.each([["inbox"], ["log"], ["cancelled"]] as const)(
     "cards cannot pause from %s",
     (from) => {
       expectDenied(card(from, { executor: "agent" }), "blocked", human);
@@ -160,24 +186,24 @@ describe("pausing (blocked / waiting)", () => {
 
 describe("resuming", () => {
   it("a paused card resumes only to the state it was paused from", () => {
-    const blocked = card("blocked", { executor: "agent", pausedFrom: "in_progress" });
-    expectAllowed(blocked, "in_progress", agent);
-    expectAllowed(blocked, "in_progress", human);
-    expectDenied(blocked, "ready", agent);
-    expectDenied(blocked, "ready", human);
+    const blocked = card("blocked", { executor: "agent", pausedFrom: "active" });
+    expectAllowed(blocked, "active", agent);
+    expectAllowed(blocked, "active", human);
+    expectDenied(blocked, "staging", agent);
+    expectDenied(blocked, "staging", human);
   });
 
   it("a card with no recorded pausedFrom cannot resume", () => {
-    expectDenied(card("blocked", { executor: "agent" }), "in_progress", human);
+    expectDenied(card("blocked", { executor: "agent" }), "active", human);
   });
 
   it("the system may resume waiting cards but not blocked ones", () => {
-    expectAllowed(card("waiting", { executor: "agent", pausedFrom: "ready" }), "ready", system);
-    expectDenied(card("blocked", { executor: "agent", pausedFrom: "ready" }), "ready", system);
+    expectAllowed(card("waiting", { executor: "agent", pausedFrom: "staging" }), "staging", system);
+    expectDenied(card("blocked", { executor: "agent", pausedFrom: "staging" }), "staging", system);
   });
 
   it("an agent may not resume someone else's card", () => {
-    expectDenied(card("blocked", { executor: "human", pausedFrom: "in_progress" }), "in_progress", agent);
+    expectDenied(card("blocked", { executor: "human", pausedFrom: "active" }), "active", agent);
   });
 });
 
@@ -194,7 +220,7 @@ describe("cancellation", () => {
 describe("terminal states are terminal", () => {
   const actors = [human, agent, system];
 
-  it.each([["done"], ["cancelled"]] as const)("nothing leaves %s", (from) => {
+  it.each([["log"], ["cancelled"]] as const)("nothing leaves %s", (from) => {
     for (const to of CARD_STATES) {
       for (const actor of actors) {
         expectDenied(card(from, { executor: "agent" }), to, actor);
@@ -205,14 +231,14 @@ describe("terminal states are terminal", () => {
 
 describe("no-ops and unknown transitions", () => {
   it("a transition to the current state is denied", () => {
-    expectDenied(card("ready", { executor: "human" }), "ready", human);
+    expectDenied(card("staging", { executor: "human" }), "staging", human);
   });
 
-  it("transitions not in the table are denied even for humans", () => {
-    expectDenied(card("inbox"), "ready", human); // must triage first
-    expectDenied(card("inbox"), "done", human);
-    expectDenied(card("backlog"), "in_progress", human); // must be marked ready
-    expectDenied(card("done"), "in_progress", human); // no reopening
-    expectDenied(card("ready"), "inbox", human); // nothing returns to inbox
+  it("transitions not in the table are denied", () => {
+    expectDenied(card("inbox"), "active", human);  // must schedule first
+    expectDenied(card("inbox"), "log", human);
+    expectDenied(card("staging"), "staging", human); // no-op
+    expectDenied(card("log"), "active", human);    // no reopening
+    expectDenied(card("active"), "inbox", human);  // nothing jumps back to inbox
   });
 });
